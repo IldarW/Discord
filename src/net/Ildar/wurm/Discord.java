@@ -1,6 +1,8 @@
 package net.Ildar.wurm;
 
-import com.wurmonline.client.renderer.gui.*;
+import com.wurmonline.client.renderer.gui.AbstractTab;
+import com.wurmonline.client.renderer.gui.ChatManagerManager;
+import com.wurmonline.client.renderer.gui.HeadsUpDisplay;
 import com.wurmonline.shared.util.MulticolorLineSegment;
 import javassist.ClassPool;
 import javassist.CtClass;
@@ -24,7 +26,6 @@ import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 public class Discord extends ListenerAdapter implements WurmClientMod, Initable, Configurable {
     private static final String ON_MESSAGE = ":ok_hand: Bot is on :ok_hand:";
@@ -42,7 +43,7 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
     private static JDA jda;
     private static String botToken;
     private static String serverName;
-    private static String villageChannel;
+    private static Map<String,String> transfers;
     private static Discord instance;
     private long lastTimeWhoIsOnlineChecked = 0;
     private static List<Function<String, Boolean>> filters = new ArrayList<>();
@@ -50,28 +51,30 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
     //handle ingame chat message
     public static void  onGameMessage(String context, Object input, boolean silent) {
         String message;
-        if (!"Village".equals(context)) 
-            return;
-        if (input instanceof List) {
-            StringBuilder sb = new StringBuilder();
-            for (Iterator<MulticolorLineSegment> iter = ((List)input).iterator(); iter.hasNext(); ) {
-                MulticolorLineSegment segment = iter.next();
-                sb.append(segment.getText());
-            }
-            message = sb.toString();
-        } else
-            message = (String)input;
-        message = message.substring(11).trim();
-        if (message.isEmpty()) return;
-        for (Function filter : filters)
-            try {
-                if ((boolean) filter.apply( message))
+        for (Map.Entry<String,String> transfer:transfers.entrySet()) {
+            if (!transfer.getKey().equals(context))
+                continue;
+            if (input instanceof List) {
+                StringBuilder sb = new StringBuilder();
+                for (Iterator<MulticolorLineSegment> iter = ((List) input).iterator(); iter.hasNext(); ) {
+                    MulticolorLineSegment segment = iter.next();
+                    sb.append(segment.getText());
+                }
+                message = sb.toString();
+            } else
+                message = (String) input;
+            message = message.substring(11).trim();
+            if (message.isEmpty()) return;
+            for (Function filter : filters)
+                try {
+                    if ((boolean) filter.apply(message))
+                        return;
+                } catch (Exception e) {
+                    hud.consoleOutput("Exception on filtering in onGameMessage() - " + e.getMessage());
                     return;
-            } catch (PatternSyntaxException e) {
-                logger.severe(e.getMessage());
-                return;
-            }
-        sendDiscordMessage(message);
+                }
+            sendDiscordMessage(message, transfer.getValue());
+        }
     }
 
     public static void disconnect() {
@@ -79,14 +82,19 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
             hud.consoleOutput("Discord is not on.");
             return;
         }
-        sendDiscordMessage(OFF_MESSAGE);
+        sendDiscordBroadcast(OFF_MESSAGE);
         jda.shutdown();
         jda = null;
         hud.consoleOutput("Discord is off");
     }
 
+    private static void sendDiscordBroadcast(String message) {
+        for (Map.Entry<String,String> transfer:transfers.entrySet()) {
+            sendDiscordMessage(message, transfer.getValue());
+        }
+    }
     //...
-    private static void sendDiscordMessage(String message) {
+    private static void sendDiscordMessage(String message, String channel) {
         if (jda == null)
             return;
         MessageBuilder builder = new MessageBuilder();
@@ -94,7 +102,7 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
         try {
             jda.getGuildsByName(serverName, true)
                     .get(0)
-                    .getTextChannelsByName(villageChannel, true)
+                    .getTextChannelsByName(channel, true)
                     .get(0)
                     .sendMessage(builder.build()).queue();
         } catch(Exception e) {
@@ -103,8 +111,8 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
         }
     }
 
-    //get comma separated list of players in Village tab
-    public static String getOnlinePlayers(){
+    //get comma separated list of players in chat tab
+    public static String getOnlinePlayers(String chatTab){
         List<String> list = new ArrayList<>();
         StringBuilder sb = new StringBuilder();
         try {
@@ -114,7 +122,7 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
                     ReflectionUtil.getField(cmm.getClass(), "chatChatPanel"));
             Map<String, AbstractTab> tabs = ReflectionUtil.getPrivateField(ccp,
                     ReflectionUtil.getField(ccp.getClass(), "tabs"));
-            AbstractTab tab = tabs.get("Village");
+            AbstractTab tab = tabs.get(chatTab);
             Object memberList = ReflectionUtil.getPrivateField(tab,
                     ReflectionUtil.getField(tab.getClass(), "memberList"));
             List lines = ReflectionUtil.getPrivateField(memberList,
@@ -143,7 +151,7 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
     public static boolean handleInput(final String cmd, final String[] data) {
         switch (cmd) {
             case "discord":
-                String usage = "Usage: discord {on|off}";
+                String usage = "Usage: discord {on|off|info}";
                 if (data.length == 2) {
                     switch (data[1]){
                         case "on":
@@ -151,13 +159,17 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
                                 hud.consoleOutput("Discord is already on.");
                                 return true;
                             } else {
+                                if (transfers.size() == 0) {
+                                    hud.consoleOutput("Add transfers to config file first!");
+                                    return true;
+                                }
                                 new Thread(() ->{
                                     try {
                                         jda = new JDABuilder(AccountType.BOT)
                                                 .setToken(botToken)
                                                 .addEventListener(instance)
                                                 .buildBlocking();
-                                        sendDiscordMessage(ON_MESSAGE);
+                                        sendDiscordBroadcast(ON_MESSAGE);
                                         Discord.hud.consoleOutput("Discord is on.");
                                     } catch (LoginException | InterruptedException | RateLimitedException e) {
                                         hud.consoleOutput("Error - " + e.getMessage());
@@ -169,8 +181,20 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
                         case "off":
                             disconnect();
                             break;
+                        case "info":
+                            if (transfers.size() == 0)
+                                hud.consoleOutput("You didn't configure transfers in config file!");
+                            else {
+                                for (Map.Entry<String,String> entry : transfers.entrySet()) {
+                                    hud.consoleOutput(entry.getKey() + " -> " + entry.getValue());
+                                }
+                            }
+                            break;
+                        default:
+                            hud.consoleOutput(usage);
                     }
-                }
+                } else
+                    hud.consoleOutput(usage);
                 return true;
             default:
                 return false;
@@ -184,30 +208,31 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
         super.onMessageReceived(event);
         if(jda == null) return;
         if (event.isFromType(ChannelType.TEXT) && !event.getAuthor().isBot()) {
-            if (event.getChannel().getName().equals(villageChannel)) {
-                String message;
-                String wurmChannel = "Village";
-                if (event.getMessage().getContentDisplay().equals("!who")) {
-                    if (Math.abs(lastTimeWhoIsOnlineChecked - System.currentTimeMillis()) < 10000) {
-                        hud.consoleOutput(TOO_QUICK_WHO_MESSAGE + " Time - " + lastTimeWhoIsOnlineChecked);
-                        sendDiscordMessage(TOO_QUICK_WHO_MESSAGE);
-                        return;
+            for (Map.Entry<String,String> transfer:transfers.entrySet()) {
+                if (event.getChannel().getName().equals(transfer.getValue())) {
+                    String message;
+                    if (event.getMessage().getContentDisplay().equals("!who")) {
+                        if (Math.abs(lastTimeWhoIsOnlineChecked - System.currentTimeMillis()) < 10000) {
+                            hud.consoleOutput(TOO_QUICK_WHO_MESSAGE + " Time - " + lastTimeWhoIsOnlineChecked);
+                            sendDiscordMessage(TOO_QUICK_WHO_MESSAGE, transfer.getValue());
+                            return;
+                        }
+                        lastTimeWhoIsOnlineChecked = System.currentTimeMillis();
+                        hud.consoleOutput("!who executed. Time - " + lastTimeWhoIsOnlineChecked);
+                        String onlinemembers = getOnlinePlayers(transfer.getKey());
+                        if (onlinemembers != null && !onlinemembers.isEmpty()) {
+                            if (!playerName().equals(event.getAuthor().getName()))
+                                hud.getWorld().getServerConnection().sendmessage5(transfer.getKey(), "/me " + CONVEYED_TO_DISCORD + " [" + event.getAuthor().getName() + "] " + PLAYERS_LIST);
+                            message = String.format(INTHEGAME_MESSAGE, onlinemembers);
+                            sendDiscordMessage(message,transfer.getValue());
+                        }
+                    } else {
+                        if (event.getAuthor().getName().equals(playerName()))
+                            message = String.format("/me " + TOLD_IN_DISCORD + ": %s\n", event.getMessage().getContentDisplay());
+                        else
+                            message = String.format("/me " + CONVEYED_FROM_DISCORD + " [%s]: %s\n", event.getAuthor().getName(), event.getMessage().getContentDisplay());
+                        hud.getWorld().getServerConnection().sendmessage5(transfer.getKey(), message);
                     }
-                    lastTimeWhoIsOnlineChecked = System.currentTimeMillis();
-                    hud.consoleOutput("!who executed. Time - " + lastTimeWhoIsOnlineChecked);
-                    String onlinemembers = getOnlinePlayers();
-                    if (onlinemembers != null && !onlinemembers.isEmpty()) {
-                        if (!playerName().equals(event.getAuthor().getName()))
-                            hud.getWorld().getServerConnection().sendmessage5("Village", "/me " + CONVEYED_TO_DISCORD +" [" + event.getAuthor().getName() + "] " + PLAYERS_LIST);
-                        message = String.format(INTHEGAME_MESSAGE, onlinemembers);
-                        sendDiscordMessage(message);
-                    }
-                } else {
-                    if (event.getAuthor().getName().equals(playerName()))
-                        message = String.format("/me " + TOLD_IN_DISCORD + ": %s\n", event.getMessage().getContentDisplay());
-                    else
-                        message = String.format("/me " + CONVEYED_FROM_DISCORD + " [%s]: %s\n", event.getAuthor().getName(), event.getMessage().getContentDisplay());
-                    hud.getWorld().getServerConnection().sendmessage5(wurmChannel, message);
                 }
             }
         }
@@ -222,7 +247,13 @@ public class Discord extends ListenerAdapter implements WurmClientMod, Initable,
     public void configure(Properties properties) {
         botToken = properties.getProperty("discordBotToken");
         serverName = properties.getProperty("discordServer");
-        villageChannel = properties.getProperty("discordVillageChannel");
+        transfers = new HashMap<>();
+        String transfersStrings = properties.getProperty("discordTransfers");
+        if (transfersStrings != null)
+            for (String transferString:transfersStrings.split(";")) {
+                String[] transferSplitted = transferString.split("->");
+                transfers.put(transferSplitted[0], transferSplitted[1]);
+            }
         logger.info("Config loaded");
         instance = this;
     }
